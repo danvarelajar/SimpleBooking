@@ -1,0 +1,14 @@
+services:
+  simplebooking:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    environment:
+      # Required for Jarvis connections when auth is enabled.
+      # Put this in a local .env file (not committed) or export in your shell.
+      MCP_API_KEY: "${MCP_API_KEY}"
+      PORT: "8787"
+    ports:
+      - "8787:8787"
+
+

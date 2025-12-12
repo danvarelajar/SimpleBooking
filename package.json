@@ -1,0 +1,15 @@
+{
+  "name": "simplebooking-mcp-mock",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Mock hotel + flights quoting app with an MCP-like HTTP JSON-RPC interface (educational).",
+  "scripts": {
+    "start": "node src/server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
+
+

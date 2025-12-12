@@ -1,0 +1,566 @@
+import http from "node:http";
+import { URL } from "node:url";
+import crypto from "node:crypto";
+import { analyzeUntrustedText, simulateNaiveAgentDecision } from "./lab.js";
+
+/**
+ * Minimal “MCP-like” JSON-RPC over HTTP.
+ * NOTE: This is NOT a full MCP transport implementation; it’s a small compatible-shaped interface
+ * for educational demos and local integration tests.
+ */
+
+const PORT = Number(process.env.PORT || 8787);
+const MCP_API_KEY = process.env.MCP_API_KEY || ""; // if set, require X-API-Key on MCP endpoints
+
+function makeRequestId() {
+  // non-crypto request id for correlation (ok for a mock server)
+  return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
+function makeSessionId() {
+  return `${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 14)}`;
+}
+
+function json(res, statusCode, body) {
+  const payload = JSON.stringify(body, null, 2);
+  res.writeHead(statusCode, {
+    "content-type": "application/json; charset=utf-8",
+    "content-length": Buffer.byteLength(payload)
+  });
+  res.end(payload);
+}
+
+function writeSse(res, event, data) {
+  // SSE: event + data (split into lines)
+  if (event) res.write(`event: ${event}\n`);
+  const text = typeof data === "string" ? data : JSON.stringify(data);
+  for (const line of text.split("\n")) {
+    res.write(`data: ${line}\n`);
+  }
+  res.write("\n");
+}
+
+function badRequest(res, message, extra) {
+  json(res, 400, { error: message, ...(extra ? { extra } : {}) });
+}
+
+function unauthorized(res) {
+  json(res, 401, { error: "unauthorized" });
+}
+
+function getHeader(req, name) {
+  const key = name.toLowerCase();
+  const v = req.headers[key];
+  if (Array.isArray(v)) return v[0];
+  return v;
+}
+
+function timingSafeEquals(a, b) {
+  const ab = Buffer.from(String(a), "utf8");
+  const bb = Buffer.from(String(b), "utf8");
+  if (ab.length !== bb.length) return false;
+  return crypto.timingSafeEqual(ab, bb);
+}
+
+function requireApiKey(req) {
+  if (!MCP_API_KEY) return true; // dev-friendly: if not configured, allow
+  const provided = getHeader(req, "x-api-key") || getHeader(req, "x-api_key") || getHeader(req, "x-api-key".toUpperCase());
+  if (!provided) return false;
+  return timingSafeEquals(provided, MCP_API_KEY);
+}
+
+function nowIso() {
+  return new Date().toISOString();
+}
+
+function assertString(name, v) {
+  if (typeof v !== "string" || v.trim() === "") throw new Error(`${name} must be a non-empty string`);
+}
+
+function assertPositiveInt(name, v) {
+  if (!Number.isInteger(v) || v <= 0) throw new Error(`${name} must be a positive integer`);
+}
+
+function parseIsoDate(name, s) {
+  assertString(name, s);
+  // Only accept YYYY-MM-DD for demo simplicity.
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(s)) throw new Error(`${name} must be YYYY-MM-DD`);
+  const d = new Date(`${s}T00:00:00.000Z`);
+  if (Number.isNaN(d.getTime())) throw new Error(`${name} is not a valid date`);
+  return d;
+}
+
+function daysBetween(startDate, endDate) {
+  const ms = endDate.getTime() - startDate.getTime();
+  return Math.ceil(ms / (24 * 60 * 60 * 1000));
+}
+
+function clamp(n, min, max) {
+  return Math.max(min, Math.min(max, n));
+}
+
+function stableHash(str) {
+  // FNV-1a-ish tiny hash (deterministic, not crypto).
+  let h = 2166136261;
+  for (let i = 0; i < str.length; i++) {
+    h ^= str.charCodeAt(i);
+    h = Math.imul(h, 16777619);
+  }
+  return h >>> 0;
+}
+
+function priceFromSeed(seed, { min, max }) {
+  const span = max - min;
+  const normalized = (seed % 10000) / 9999; // 0..1
+  return Math.round(min + normalized * span);
+}
+
+function sanitizeText(s) {
+  // Defensive: trim and remove control chars; keep it simple.
+  return String(s).replace(/[\u0000-\u001F\u007F]/g, "").trim();
+}
+
+const CITY_TO_IATA = new Map(
+  Object.entries({
+    "san francisco": "SFO",
+    "new york": "JFK",
+    "los angeles": "LAX",
+    "chicago": "ORD",
+    "miami": "MIA",
+    "london": "LHR",
+    "paris": "CDG",
+    "madrid": "MAD",
+    "barcelona": "BCN",
+    "rome": "FCO",
+    "milan": "MXP",
+    "amsterdam": "AMS",
+    "berlin": "BER",
+    "tokyo": "HND",
+    "osaka": "KIX",
+    "seoul": "ICN",
+    "singapore": "SIN",
+    "sydney": "SYD",
+    "melbourne": "MEL",
+    "mexico city": "MEX",
+    "bogota": "BOG",
+    "sao paulo": "GRU",
+    "rio de janeiro": "GIG",
+    "toronto": "YYZ",
+    "vancouver": "YVR"
+  })
+);
+
+function normalizeAirportCode(input) {
+  const raw = sanitizeText(input);
+  const upper = raw.toUpperCase();
+  if (/^[A-Z]{3}$/.test(upper)) return upper;
+
+  const cityKey = raw.toLowerCase();
+  const mapped = CITY_TO_IATA.get(cityKey);
+  if (mapped) return mapped;
+
+  // Fallback: derive a pseudo-code for mock responses (not real-world accurate).
+  const letters = raw.replace(/[^a-zA-Z]/g, "").toUpperCase();
+  if (letters.length >= 3) return letters.slice(0, 3);
+  return (letters + "XXX").slice(0, 3);
+}
+
+function makeFlightQuote({ from, to, departDate, returnDate, passengers }) {
+  assertString("from", from);
+  assertString("to", to);
+  const dep = parseIsoDate("departDate", departDate);
+  const ret = parseIsoDate("returnDate", returnDate);
+  assertPositiveInt("passengers", passengers);
+  if (ret.getTime() <= dep.getTime()) throw new Error("returnDate must be after departDate");
+
+  const carriers = ["SkyLark Air", "NovaJet Airways", "Cobalt Cloud Airlines"];
+  const seedBase = `${from}|${to}|${departDate}|${returnDate}|${passengers}`;
+  const seed = stableHash(seedBase);
+  const carrier = carriers[seed % carriers.length];
+
+  const outSeed = stableHash(seedBase + "|out");
+  const inSeed = stableHash(seedBase + "|in");
+
+  const outboundPerPax = priceFromSeed(outSeed, { min: 80, max: 620 });
+  const inboundPerPax = priceFromSeed(inSeed, { min: 80, max: 620 });
+
+  const flightNumberOut = `${carrier.split(" ")[0].slice(0, 2).toUpperCase()}-${100 + (outSeed % 900)}`;
+  const flightNumberIn = `${carrier.split(" ")[0].slice(0, 2).toUpperCase()}-${100 + (inSeed % 900)}`;
+
+  const fromCode = normalizeAirportCode(from);
+  const toCode = normalizeAirportCode(to);
+
+  const outbound = {
+    carrier,
+    flightNumber: flightNumberOut,
+    from: fromCode,
+    to: toCode,
+    date: departDate,
+    price: outboundPerPax * passengers
+  };
+  const inbound = {
+    carrier,
+    flightNumber: flightNumberIn,
+    from: toCode,
+    to: fromCode,
+    date: returnDate,
+    price: inboundPerPax * passengers
+  };
+
+  return {
+    currency: "USD",
+    passengers,
+    outbound,
+    inbound,
+    total: outbound.price + inbound.price
+  };
+}
+
+function makeHotelQuote({ city, checkInDate, checkOutDate, rooms }) {
+  assertString("city", city);
+  const inD = parseIsoDate("checkInDate", checkInDate);
+  const outD = parseIsoDate("checkOutDate", checkOutDate);
+  assertPositiveInt("rooms", rooms);
+  if (outD.getTime() <= inD.getTime()) throw new Error("checkOutDate must be after checkInDate");
+
+  const nights = daysBetween(inD, outD);
+  if (nights <= 0) throw new Error("stay must be at least 1 night");
+  if (nights > 30) throw new Error("stay too long for mock system (max 30 nights)");
+
+  const hotels = ["Aurora Suites", "Pine Harbor Hotel", "Saffron Meridian Inn", "Juniper Gate Lodge"];
+  const seedBase = `${city}|${checkInDate}|${checkOutDate}|${rooms}`;
+  const seed = stableHash(seedBase);
+  const name = hotels[seed % hotels.length];
+
+  const nightly = priceFromSeed(seed, { min: 90, max: 480 });
+  const total = nightly * nights * rooms;
+
+  return {
+    currency: "USD",
+    hotel: {
+      name,
+      city: sanitizeText(city),
+      rooms,
+      checkInDate,
+      checkOutDate,
+      nights,
+      pricePerNightPerRoom: nightly,
+      total
+    }
+  };
+}
+
+const TOOLS = [
+  {
+    name: "search_flights",
+    description: "Return a mock round-trip flight quote.",
+    inputSchema: {
+      type: "object",
+      additionalProperties: false,
+      required: ["from", "to", "departDate", "returnDate", "passengers"],
+      properties: {
+        from: { type: "string", description: "Origin (city name or airport code, e.g. 'San Francisco' or 'SFO')" },
+        to: { type: "string", description: "Destination (city name or airport code, e.g. 'New York' or 'JFK')" },
+        departDate: { type: "string", description: "YYYY-MM-DD" },
+        returnDate: { type: "string", description: "YYYY-MM-DD" },
+        passengers: { type: "integer", minimum: 1 }
+      }
+    }
+  },
+  {
+    name: "search_hotels",
+    description: "Return a mock hotel quote.",
+    inputSchema: {
+      type: "object",
+      additionalProperties: false,
+      required: ["city", "checkInDate", "checkOutDate", "rooms"],
+      properties: {
+        city: { type: "string" },
+        checkInDate: { type: "string", description: "YYYY-MM-DD" },
+        checkOutDate: { type: "string", description: "YYYY-MM-DD" },
+        rooms: { type: "integer", minimum: 1 }
+      }
+    }
+  },
+  {
+    name: "create_itinerary",
+    description: "Return both flight and hotel quotes for a trip.",
+    inputSchema: {
+      type: "object",
+      additionalProperties: false,
+      required: ["from", "to", "departDate", "returnDate", "city", "checkInDate", "checkOutDate", "passengers", "rooms"],
+      properties: {
+        from: { type: "string" },
+        to: { type: "string" },
+        departDate: { type: "string", description: "YYYY-MM-DD" },
+        returnDate: { type: "string", description: "YYYY-MM-DD" },
+        city: { type: "string" },
+        checkInDate: { type: "string", description: "YYYY-MM-DD" },
+        checkOutDate: { type: "string", description: "YYYY-MM-DD" },
+        passengers: { type: "integer", minimum: 1 },
+        rooms: { type: "integer", minimum: 1 }
+      }
+    }
+  }
+  ,
+  {
+    name: "simulate_tool_injection",
+    description:
+      "SECURITY LAB (safe): analyze untrusted text for prompt/tool injection indicators and simulate what a naive vs safe agent would do.",
+    inputSchema: {
+      type: "object",
+      additionalProperties: false,
+      required: ["untrustedText"],
+      properties: {
+        untrustedText: { type: "string", description: "Any untrusted content (web page, tool output, user message, etc.)" }
+      }
+    }
+  }
+];
+
+function handleToolCall(name, args) {
+  if (name === "search_flights") return makeFlightQuote(args);
+  if (name === "search_hotels") return makeHotelQuote(args);
+  if (name === "create_itinerary") {
+    const flight = makeFlightQuote({
+      from: args.from,
+      to: args.to,
+      departDate: args.departDate,
+      returnDate: args.returnDate,
+      passengers: args.passengers
+    });
+    const hotel = makeHotelQuote({
+      city: args.city,
+      checkInDate: args.checkInDate,
+      checkOutDate: args.checkOutDate,
+      rooms: args.rooms
+    });
+    return {
+      generatedAt: nowIso(),
+      currency: "USD",
+      flight,
+      hotel,
+      grandTotal: flight.total + hotel.hotel.total
+    };
+  }
+  if (name === "simulate_tool_injection") {
+    return simulateNaiveAgentDecision({
+      untrustedText: args.untrustedText,
+      availableTools: TOOLS.map((t) => t.name)
+    });
+  }
+  throw new Error(`Unknown tool: ${name}`);
+}
+
+function mcpJsonRpcSuccess(id, result) {
+  return { jsonrpc: "2.0", id, result };
+}
+
+function mcpJsonRpcError(id, code, message, data) {
+  return {
+    jsonrpc: "2.0",
+    id: id ?? null,
+    error: {
+      code,
+      message,
+      ...(data ? { data } : {})
+    }
+  };
+}
+
+async function readJsonBody(req, { maxBytes = 256 * 1024 } = {}) {
+  const chunks = [];
+  let total = 0;
+  for await (const c of req) {
+    total += c.length;
+    if (total > maxBytes) throw new Error("Request body too large");
+    chunks.push(c);
+  }
+  const raw = Buffer.concat(chunks).toString("utf8");
+  if (!raw) return null;
+  return JSON.parse(raw);
+}
+
+function processJsonRpc(body, { requestId } = {}) {
+  const { jsonrpc, id, method, params } = body || {};
+  if (jsonrpc !== "2.0") return mcpJsonRpcError(id, -32600, "Invalid Request", { reason: "jsonrpc must be 2.0" });
+  if (typeof method !== "string") return mcpJsonRpcError(id, -32600, "Invalid Request", { reason: "method must be a string" });
+
+  // MCP-ish method set
+  if (method === "initialize") {
+    return mcpJsonRpcSuccess(id, {
+      protocolVersion: "2025-06-18",
+      serverInfo: { name: "SimpleBooking Mock MCP", version: "0.1.0" },
+      capabilities: {
+        tools: { listChanged: false },
+        prompts: {},
+        resources: {}
+      }
+    });
+  }
+
+  if (method === "notifications/initialized") {
+    // Notification: no response expected.
+    return null;
+  }
+
+  if (method === "tools/list") {
+    return mcpJsonRpcSuccess(id, { tools: TOOLS });
+  }
+
+  // Be forgiving: some clients may probe these.
+  if (method === "prompts/list") return mcpJsonRpcSuccess(id, { prompts: [] });
+  if (method === "resources/list") return mcpJsonRpcSuccess(id, { resources: [] });
+
+  if (method === "tools/call") {
+    if (!params || typeof params !== "object") return mcpJsonRpcError(id, -32602, "Invalid params");
+    const name = params.name;
+    const args = params.arguments ?? {};
+    if (typeof name !== "string") return mcpJsonRpcError(id, -32602, "Invalid params", { reason: "params.name must be a string" });
+    if (typeof args !== "object" || args === null || Array.isArray(args)) {
+      return mcpJsonRpcError(id, -32602, "Invalid params", { reason: "params.arguments must be an object" });
+    }
+
+    // eslint-disable-next-line no-console
+    console.log(JSON.stringify({ time: nowIso(), requestId, event: "tool_call", tool: name }));
+
+    const result = handleToolCall(name, args);
+    return mcpJsonRpcSuccess(id, {
+      content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
+      isError: false
+    });
+  }
+
+  return mcpJsonRpcError(id, -32601, "Method not found");
+}
+
+// SSE sessions: sessionId -> res
+const SSE_SESSIONS = new Map();
+
+const server = http.createServer(async (req, res) => {
+  const requestId = makeRequestId();
+  try {
+    const url = new URL(req.url || "/", `http://${req.headers.host || "localhost"}`);
+    res.setHeader("x-request-id", requestId);
+
+    if (req.method === "GET" && url.pathname === "/health") {
+      return json(res, 200, { ok: true, time: nowIso() });
+    }
+
+    // MCP SSE transport (Jarvis uses URL ending in /sse)
+    // Pattern: client GETs /sse (EventSource). Server replies with:
+    // - an "endpoint" event that tells the client where to POST messages
+    // - subsequent "message" events containing JSON-RPC responses
+    if (req.method === "GET" && url.pathname === "/sse") {
+      if (!requireApiKey(req)) {
+        res.writeHead(401, { "content-type": "text/plain; charset=utf-8" });
+        res.end("unauthorized");
+        return;
+      }
+      const sessionId = makeSessionId();
+      res.writeHead(200, {
+        "content-type": "text/event-stream; charset=utf-8",
+        "cache-control": "no-cache, no-transform",
+        connection: "keep-alive"
+      });
+
+      SSE_SESSIONS.set(sessionId, res);
+
+      // Advertise the POST endpoint for client->server messages.
+      // Emit an absolute URL for maximum client compatibility.
+      const base = `${url.protocol}//${url.host}`;
+      writeSse(res, "endpoint", `${base}/messages?sessionId=${encodeURIComponent(sessionId)}`);
+      writeSse(res, "session", sessionId);
+
+      // Keep-alives to prevent idle disconnects.
+      const keepAlive = setInterval(() => {
+        try {
+          res.write(`: keep-alive ${Date.now()}\n\n`);
+        } catch {
+          /* ignore */
+        }
+      }, 15000);
+
+      req.on("close", () => {
+        clearInterval(keepAlive);
+        SSE_SESSIONS.delete(sessionId);
+      });
+
+      return; // keep connection open
+    }
+
+    if (req.method === "POST" && url.pathname === "/messages") {
+      if (!requireApiKey(req)) return unauthorized(res);
+      const sessionId = url.searchParams.get("sessionId");
+      if (!sessionId) return badRequest(res, "missing sessionId");
+
+      const sseRes = SSE_SESSIONS.get(sessionId);
+      if (!sseRes) return badRequest(res, "unknown sessionId (SSE session not connected)");
+
+      const contentType = String(req.headers["content-type"] || "");
+      if (!contentType.includes("application/json")) return badRequest(res, "content-type must be application/json");
+
+      const body = await readJsonBody(req);
+      if (!body) return badRequest(res, "missing JSON body");
+
+      const responseMsg = processJsonRpc(body, { requestId });
+      if (responseMsg) writeSse(sseRes, "message", responseMsg);
+
+      // Acknowledge receipt; the actual JSON-RPC response is delivered over SSE.
+      return json(res, 200, { ok: true, requestId });
+    }
+
+    // Security lab endpoints (safe simulation)
+    if (req.method === "GET" && url.pathname === "/lab/health") {
+      return json(res, 200, { ok: true, lab: true, time: nowIso() });
+    }
+
+    if (req.method === "POST" && url.pathname === "/lab/analyze") {
+      const contentType = String(req.headers["content-type"] || "");
+      if (!contentType.includes("application/json")) return badRequest(res, "content-type must be application/json");
+      const body = await readJsonBody(req);
+      const untrustedText = body?.untrustedText;
+      if (typeof untrustedText !== "string") return badRequest(res, "untrustedText must be a string");
+      return json(res, 200, { requestId, ...analyzeUntrustedText(untrustedText) });
+    }
+
+    if (req.method === "POST" && url.pathname === "/mcp") {
+      if (!requireApiKey(req)) return unauthorized(res);
+      const contentType = String(req.headers["content-type"] || "");
+      if (!contentType.includes("application/json")) return badRequest(res, "content-type must be application/json");
+
+      const body = await readJsonBody(req);
+      if (!body) return badRequest(res, "missing JSON body");
+
+      const responseMsg = processJsonRpc(body, { requestId });
+      // Notifications return null.
+      if (!responseMsg) return json(res, 200, { ok: true, requestId });
+      return json(res, 200, responseMsg);
+    }
+
+    json(res, 404, { error: "not found" });
+  } catch (err) {
+    json(res, 500, { error: "internal error", message: err?.message || String(err) });
+  }
+});
+
+server.on("error", (err) => {
+  // eslint-disable-next-line no-console
+  console.error("[SimpleBooking] Server error:", err?.message || err);
+  if (err && typeof err === "object" && err.code === "EADDRINUSE") {
+    // eslint-disable-next-line no-console
+    console.error(`[SimpleBooking] Port already in use. Try a different PORT (e.g. PORT=0 for ephemeral).`);
+  }
+  process.exitCode = 1;
+});
+
+server.listen(PORT, () => {
+  const addr = server.address();
+  const port = typeof addr === "object" && addr ? addr.port : PORT;
+  // eslint-disable-next-line no-console
+  console.log(`[SimpleBooking] MCP-like HTTP server listening on http://localhost:${port}`);
+  console.log(`- POST /mcp (JSON-RPC 2.0)`);
+  console.log(`- GET  /health`);
+});
+
+
