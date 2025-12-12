@@ -7,7 +7,7 @@ WORKDIR /app
 COPY --chown=node:node package.json /app/package.json
 COPY --chown=node:node src /app/src
 COPY --chown=node:node README.md /app/README.md
-COPY --chown=node:node LAB_EXERCISES.md /app/LAB_EXERCISES.md
+# Lab docs are useful in-repo but not required at runtime; avoid failing builds if excluded from build context.
 
 ENV NODE_ENV=production
 ENV PORT=8787
