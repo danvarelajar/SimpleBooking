@@ -30,6 +30,11 @@ By default logs are **pretty** (easy to read). To switch to JSON (easy to ingest
 SIMPLEBOOKING_DEBUG=TRUE SIMPLEBOOKING_LOG_FORMAT=json npm run start
 ```
 
+### Debug verbosity knobs
+
+- `SIMPLEBOOKING_DEBUG_HEADERS=TRUE`: log full request headers (still redacted) instead of a compact header summary.
+- `SIMPLEBOOKING_LOG_MAX_CHARS=2000`: truncate large pretty-printed fields (defaults to `1200`).
+
 If you also want to log JSON bodies / tool arguments (no headers; still avoid in production):
 
 ```bash

@@ -23,7 +23,9 @@ function parseBoolEnv(name, defaultValue = false) {
 
 const DEBUG = parseBoolEnv("SIMPLEBOOKING_DEBUG", false) || parseBoolEnv("DEBUG", false);
 const DEBUG_LOG_BODIES = parseBoolEnv("SIMPLEBOOKING_DEBUG_BODIES", false);
+const DEBUG_LOG_HEADERS = parseBoolEnv("SIMPLEBOOKING_DEBUG_HEADERS", false);
 const LOG_FORMAT = String(process.env.SIMPLEBOOKING_LOG_FORMAT || "pretty").toLowerCase(); // pretty|json
+const LOG_MAX_FIELD_CHARS = Number(process.env.SIMPLEBOOKING_LOG_MAX_CHARS || 1200);
 
 function makeRequestId() {
   // non-crypto request id for correlation (ok for a mock server)
@@ -67,15 +69,31 @@ function emitLog(level, obj) {
     const event = obj?.event ? String(obj.event) : "-";
     const requestId = obj?.requestId ? ` requestId=${obj.requestId}` : "";
     const parts = [];
+    const multiline = [];
     for (const [k, v] of Object.entries(obj || {})) {
       if (k === "event" || k === "requestId") continue;
       if (v === undefined) continue;
-      const rendered =
-        v && typeof v === "object" ? JSON.stringify(v) : String(v);
-      parts.push(`${k}=${rendered}`);
+      const isObj = v && typeof v === "object";
+      if (!isObj) {
+        parts.push(`${k}=${String(v)}`);
+        continue;
+      }
+      const rendered = JSON.stringify(v);
+      if (rendered.length <= 160) {
+        parts.push(`${k}=${rendered}`);
+        continue;
+      }
+      // Large objects: put on their own indented block and truncate to keep logs readable.
+      const pretty = JSON.stringify(v, null, 2);
+      const truncated = pretty.length > LOG_MAX_FIELD_CHARS ? `${pretty.slice(0, LOG_MAX_FIELD_CHARS)}\n  ... (truncated)` : pretty;
+      multiline.push(`  ${k}=\n${truncated.split("\n").map((ln) => "  " + ln).join("\n")}`);
     }
     // eslint-disable-next-line no-console
-    console.log(`[${time}] ${level.toUpperCase()} ${event}${requestId}${parts.length ? " " + parts.join(" ") : ""}`);
+    console.log(
+      `[${time}] ${level.toUpperCase()} ${event}${requestId}${parts.length ? " " + parts.join(" ") : ""}${
+        multiline.length ? "\n" + multiline.join("\n") : ""
+      }`
+    );
     return;
   }
   // eslint-disable-next-line no-console
@@ -664,13 +682,25 @@ const server = http.createServer(async (req, res) => {
     const url = new URL(req.url || "/", `http://${req.headers.host || "localhost"}`);
     res.setHeader("x-request-id", requestId);
 
+    const redacted = redactHeaders(req.headers);
+    const headerKeys = Object.keys(redacted);
+    const headerSummary = {
+      host: redacted.host,
+      "user-agent": redacted["user-agent"],
+      accept: redacted.accept,
+      "content-type": redacted["content-type"],
+      "content-length": redacted["content-length"],
+      "mcp-protocol-version": redacted["mcp-protocol-version"]
+    };
+
     debugLog({
       event: "http_request",
       requestId,
       method: req.method,
       path: url.pathname,
       query: url.searchParams.toString() || null,
-      headers: redactHeaders(req.headers)
+      headerKeys,
+      headers: DEBUG_LOG_HEADERS ? redacted : headerSummary
     });
 
     if (req.method === "GET" && url.pathname === "/health") {
