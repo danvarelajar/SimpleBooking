@@ -25,6 +25,7 @@ function parseBoolEnv(name, defaultValue = false) {
 const DEBUG = parseBoolEnv("SIMPLEBOOKING_DEBUG", true) || parseBoolEnv("DEBUG", false);
 const DEBUG_LOG_BODIES = parseBoolEnv("SIMPLEBOOKING_DEBUG_BODIES", false);
 const DEBUG_LOG_HEADERS = parseBoolEnv("SIMPLEBOOKING_DEBUG_HEADERS", false);
+const DEBUG_LOG_RESPONSES = parseBoolEnv("SIMPLEBOOKING_DEBUG_RESPONSES", true);
 const LOG_FORMAT = String(process.env.SIMPLEBOOKING_LOG_FORMAT || "pretty").toLowerCase(); // pretty|json
 const LOG_MAX_FIELD_CHARS = Number(process.env.SIMPLEBOOKING_LOG_MAX_CHARS || 1200);
 
@@ -104,6 +105,56 @@ function emitLog(level, obj) {
 function debugLog(obj) {
   if (!DEBUG) return;
   emitLog("debug", obj);
+}
+
+function previewText(s, maxChars = 900) {
+  const t = String(s ?? "");
+  if (t.length <= maxChars) return t;
+  return `${t.slice(0, maxChars)}... (truncated, ${t.length - maxChars} chars omitted)`;
+}
+
+function summarizeJsonRpcResponse(resp) {
+  if (!resp || typeof resp !== "object") return { kind: "unknown" };
+  if ("error" in resp && resp.error) {
+    return {
+      kind: "error",
+      jsonrpcId: resp.id ?? null,
+      code: resp.error.code,
+      message: previewText(resp.error.message, 240)
+    };
+  }
+  if (!("result" in resp) || !resp.result) return { kind: "no_result", jsonrpcId: resp.id ?? null };
+
+  const jsonrpcId = resp.id ?? null;
+  const r = resp.result;
+
+  // tools/list
+  if (Array.isArray(r.tools)) {
+    const names = r.tools.map((t) => t?.name).filter(Boolean);
+    return { kind: "tools_list", jsonrpcId, toolsCount: names.length, toolsPreview: names.slice(0, 10) };
+  }
+
+  // Our tool call result shape
+  if (Array.isArray(r.content)) {
+    const first = r.content[0];
+    const text = first && first.type === "text" ? first.text : "";
+    return {
+      kind: "tool_result",
+      jsonrpcId,
+      isError: !!r.isError,
+      contentItems: r.content.length,
+      textBytes: typeof text === "string" ? Buffer.byteLength(text) : 0,
+      textPreview: previewText(text, 900)
+    };
+  }
+
+  return { kind: "result", jsonrpcId, keys: Object.keys(r).slice(0, 20) };
+}
+
+function debugLogJsonRpcOut({ requestId, method, tool, resp }) {
+  if (!DEBUG || !DEBUG_LOG_RESPONSES) return;
+  debugLog({ event: "jsonrpc_out", requestId, method, ...(tool ? { tool } : {}), ...summarizeJsonRpcResponse(resp) });
+  if (DEBUG_LOG_BODIES) debugLog({ event: "jsonrpc_out_body", requestId, method, ...(tool ? { tool } : {}), response: resp });
 }
 
 function getHeader(req, name) {
@@ -647,7 +698,7 @@ function processJsonRpc(body, { requestId } = {}) {
 
   // MCP-ish method set
   if (method === "initialize") {
-    return mcpJsonRpcSuccess(id, {
+    const resp = mcpJsonRpcSuccess(id, {
       protocolVersion: "2025-06-18",
       serverInfo: { name: "SimpleBooking Mock MCP", version: "0.1.0" },
       capabilities: {
@@ -658,6 +709,8 @@ function processJsonRpc(body, { requestId } = {}) {
         resources: {}
       }
     });
+    debugLogJsonRpcOut({ requestId, method, resp });
+    return resp;
   }
 
   if (method === "notifications/initialized") {
@@ -666,7 +719,9 @@ function processJsonRpc(body, { requestId } = {}) {
   }
 
   if (method === "tools/list") {
-    return mcpJsonRpcSuccess(id, { tools: TOOLS });
+    const resp = mcpJsonRpcSuccess(id, { tools: TOOLS });
+    debugLogJsonRpcOut({ requestId, method, resp });
+    return resp;
   }
 
   // Be forgiving: some clients may probe these.
@@ -694,25 +749,33 @@ function processJsonRpc(body, { requestId } = {}) {
     try {
       const result = handleToolCall(name, args);
       if (isToolResultShape(result)) {
-        return mcpJsonRpcSuccess(id, {
+        const resp = mcpJsonRpcSuccess(id, {
           content: result.content,
           isError: Boolean(result.isError)
         });
+        debugLogJsonRpcOut({ requestId, method, tool: name, resp });
+        return resp;
       }
-      return mcpJsonRpcSuccess(id, {
+      const resp = mcpJsonRpcSuccess(id, {
         content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
         isError: false
       });
+      debugLogJsonRpcOut({ requestId, method, tool: name, resp });
+      return resp;
     } catch (err) {
       const message = err?.message || String(err);
-      return mcpJsonRpcSuccess(id, {
+      const resp = mcpJsonRpcSuccess(id, {
         content: [{ type: "text", text: message }],
         isError: true
       });
+      debugLogJsonRpcOut({ requestId, method, tool: name, resp });
+      return resp;
     }
   }
 
-  return mcpJsonRpcError(id, -32601, "Method not found");
+  const resp = mcpJsonRpcError(id, -32601, "Method not found");
+  debugLogJsonRpcOut({ requestId, method, resp });
+  return resp;
 }
 
 // SSE sessions: sessionId -> res
@@ -813,6 +876,8 @@ const server = http.createServer(async (req, res) => {
       if (responseMsg) {
         writeSse(sseRes, "message", responseMsg);
         debugLog({ event: "sse_message_sent", requestId, sessionId, jsonrpcId: responseMsg.id ?? null });
+        if (DEBUG_LOG_RESPONSES) debugLog({ event: "sse_message_preview", requestId, sessionId, ...summarizeJsonRpcResponse(responseMsg) });
+        if (DEBUG_LOG_BODIES) debugLog({ event: "sse_message_body", requestId, sessionId, response: responseMsg });
       }
 
       // Acknowledge receipt; the actual JSON-RPC response is delivered over SSE.
